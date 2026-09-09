@@ -2,18 +2,28 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flame/events.dart';
-import 'package:flame/game.dart';
 import 'package:flame/extensions.dart';
+import 'package:flame/game.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'config.dart';
 import 'models.dart';
+import 'systems.dart';
 
 class SpaceSurvivalGame extends FlameGame with PanDetector {
-  SpaceSurvivalGame({required this.onSnapshot}) : super();
+  SpaceSurvivalGame({
+    required this.onSnapshot,
+    this.mode = GameMode.survival,
+    GameBalance? balance,
+  }) : balance = balance ?? GameBalance.survival,
+       super();
 
   final ValueChanged<GameSnapshot> onSnapshot;
+  final GameMode mode;
+  final GameBalance balance;
   final DifficultyManager difficulty = DifficultyManager();
   final PlayabilityValidator validator = const PlayabilityValidator();
   final math.Random _random = math.Random();
@@ -24,14 +34,30 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   final List<Particle> particles = [];
   final List<FloatingText> floatingTexts = [];
   final List<Offset> _stars = [];
-  final Map<PowerId, ActivePower> _powers = {};
   final CoinSpawnPlanner _coinPlanner = const CoinSpawnPlanner();
+  final DifficultyPhaseBook _phases = const DifficultyPhaseBook();
+  final PowerRarityTable _rarity = const PowerRarityTable();
 
-  GamePhase phase = GamePhase.home;
+  late final SpeedDirector speed = SpeedDirector(difficulty: difficulty);
+  final PowerController powers = PowerController();
+  final ScoreAccumulator scoreboard = ScoreAccumulator();
+  final PlayerController steering = PlayerController();
+  final SessionFlow flow = SessionFlow();
+  final FrameClock clock = FrameClock();
+  final AudioBus audio = AudioBus();
+  final AnalyticsBus analytics = AnalyticsBus();
+  final ObjectPool<Coin> _coinPool = ObjectPool(capacity: 96);
+  final ObjectPool<Bullet> _bulletPool = ObjectPool(capacity: 24);
+  final ObjectPool<PowerPickup> _pickupPool = ObjectPool(capacity: 8);
+  final ObjectPool<Particle> _particlePool = ObjectPool(capacity: 160);
+  final ObjectPool<ObstacleSegment> _segmentPool = ObjectPool(capacity: 64);
+
+  GamePhase get phase => flow.phase;
+  set phase(GamePhase value) => flow.phase = value;
+
   Offset playerPosition = Offset.zero;
   Offset playerTargetPosition = Offset.zero;
   double _worldDistance = 0;
-  double _worldSpeed = 220;
   double _nextCoinSpawnScrollY = 0;
   double _elapsed = 0;
   double _spawnClock = 0;
@@ -42,84 +68,96 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   double _starOffset = 0;
   double _effectSpeed = 220;
   double _lastRouteX = 0;
+  double _lastGapWidth = 120;
   double _impact = 0;
   double _bannerLife = 0;
+  double _transition = 0;
+  double _exhaustClock = 0;
   String _banner = '';
-  int score = 0;
-  int collectedCoins = 0;
   int bestScore = 0;
-  int powersUsed = 0;
   int destroyed = 0;
   bool hapticsEnabled = true;
+  bool debugView = kDebugMode;
   bool _newBest = false;
   bool _loadedStorage = false;
+  bool _lastFair = true;
+  PowerId? _assistPower;
+  GameSnapshot? _lastHud;
 
-  static const int maxObstacles = 24;
-  static const int maxCoins = 70;
-  static const int maxPickups = 5;
-  static const int maxBullets = 18;
-  static const int maxParticles = 120;
   static const double coinRadius = 9;
   static const double coinSpacing = 22;
 
-  bool get isPlaying => phase == GamePhase.playing;
+  bool get isPlaying => flow.isPlaying;
   Offset get ship => playerPosition;
-  set ship(Offset value) => playerPosition = value;
-  double get targetShipX => playerTargetPosition.dx;
-  set targetShipX(double value) =>
-      playerTargetPosition = Offset(value, playerTargetPosition.dy);
+  set ship(Offset value) {
+    playerPosition = value;
+    steering.place(value.dx, value.dy);
+  }
+
+  double get targetShipX => steering.targetX;
+  set targetShipX(double value) => steering.setDragX(value);
+
+  Rect get viewRect {
+    if (size.x <= 0 || size.y <= 0) return Rect.zero;
+    final portraitWidth = size.y * 9 / 20;
+    final width = math.min(size.x, math.max(320.0, portraitWidth));
+    final left = (size.x - width) / 2;
+    return Rect.fromLTWH(left, 0, width, size.y);
+  }
+
   Rect get playableArea {
-    final horizontalInset = math.max(20.0, size.x * .045);
-    final hudClearance = math.max(132.0, size.y * .17);
-    final bottomInset = math.max(24.0, size.y * .04);
+    final view = viewRect;
+    final horizontalInset = math.max(20.0, view.width * .045);
+    final hudClearance = math.max(132.0, view.height * .17);
+    final bottomInset = math.max(24.0, view.height * .04);
     return Rect.fromLTRB(
-      horizontalInset,
+      view.left + horizontalInset,
       hudClearance,
-      size.x - horizontalInset,
-      size.y - bottomInset,
+      view.right - horizontalInset,
+      view.bottom - bottomInset,
     );
   }
-  bool get hasShield => _powers.containsKey(PowerId.shield);
-  bool get invulnerable =>
-      _powers.containsKey(PowerId.invisibility) ||
-      _powers.containsKey(PowerId.phaseDash);
-  double get scoreMultiplier =>
-      _powers.containsKey(PowerId.doubleScore) ? 2 : 1;
-  double get coinMultiplier =>
-      _powers.containsKey(PowerId.coinMultiplier) ? 3 : 1;
-  double get pickupRadius =>
-      _powers.containsKey(PowerId.turboCollect) ? 120 : 38;
-  double get playerSpeed =>
-      PlayabilityValidator.shipSpeed *
-      (_powers.containsKey(PowerId.phaseDash) ? 1.3 : 1);
-  double get obstacleTargetSpeed {
-    if (_powers.containsKey(PowerId.emp)) return 0;
-    return difficulty.currentDifficultySpeed *
-        (_powers.containsKey(PowerId.slowTime) ? .5 : 1);
-  }
 
+  bool get hasShield => powers.hasShield;
+  bool get invulnerable => powers.invulnerable;
+  double get scoreMultiplier => powers.scoreMultiplier;
+  double get coinMultiplier => powers.coinMultiplier;
+  double get pickupRadius => powers.pickupRadius;
+  double get playerSpeed => PlayabilityValidator.shipSpeed * powers.moveScale;
+  double get obstacleTargetSpeed => speed.obstacleScrollSpeed;
   double get minimumCoinDistance => coinRadius * 2 + coinSpacing;
+  int get displayedScore => scoreboard.total;
+  int get collectedCoins => scoreboard.coinsCollected;
+  int get score => scoreboard.total;
+  int get powersUsed => powers.activations;
+  bool get lastSpawnFair => _lastFair;
 
-  int get displayedScore {
-    final survivalScore = (_elapsed * scoreMultiplier).floor();
-    return score + (phase == GamePhase.playing ? survivalScore : 0);
+  String get _countdownLabel {
+    if (_countdown > 2) return '3';
+    if (_countdown > 1) return '2';
+    if (_countdown > .4) return '1';
+    return 'GO';
   }
 
-  WorldCamera get _camera => WorldCamera(
-    offset: Offset(0, _worldDistance),
-  );
+  String get debugLine =>
+      't=${_elapsed.toStringAsFixed(1)} '
+      'world=${speed.worldScrollSpeed.toStringAsFixed(0)} '
+      'obs=${speed.obstacleScrollSpeed.toStringAsFixed(0)} '
+      'emp=${speed.empFactor.toStringAsFixed(2)} '
+      'slow=${speed.slowFactor.toStringAsFixed(2)} '
+      'gap=${_lastGapWidth.toStringAsFixed(0)} '
+      'route=${_lastRouteX.toStringAsFixed(0)} '
+      'fair=${_lastFair ? 'Y' : 'N'}';
 
-  Offset _worldToScreen(Offset position) {
-    return _camera.worldToScreen(position);
-  }
+  WorldCamera get _camera => WorldCamera(offset: Offset(0, _worldDistance));
 
-  Rect _worldRectToScreen(Rect worldRect) {
-    return _camera.worldRectToScreen(worldRect);
-  }
+  Offset _worldToScreen(Offset position) => _camera.worldToScreen(position);
 
-  double _worldYForSpawn(double screenY) {
-    return _camera.screenToWorld(Offset(0, screenY)).dy;
-  }
+  Rect _worldRectToScreen(Rect worldRect) =>
+      _camera.worldRectToScreen(worldRect);
+
+  double _worldYForSpawn(double screenY) =>
+      _camera.screenToWorld(Offset(0, screenY)).dy;
 
   @override
   Future<void> onLoad() async {
@@ -128,21 +166,26 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
     bestScore = prefs.getInt('space_survival_best') ?? 0;
     hapticsEnabled = prefs.getBool('space_survival_haptics') ?? true;
     _loadedStorage = true;
-    _emit();
+    _emit(force: true);
   }
 
   @override
   void onGameResize(Vector2 size) {
     super.onGameResize(size);
     if (size.x <= 0 || size.y <= 0) return;
+    final y = playableArea.bottom - playableArea.height * .18;
     if (ship == Offset.zero) {
-      ship = Offset(playableArea.center.dx, playableArea.bottom - playableArea.height * .18);
-      playerTargetPosition = ship;
-      _lastRouteX = ship.dx;
+      steering.place(playableArea.center.dx, y);
     } else {
-      ship = _clampPlayerPosition(ship);
-      playerTargetPosition = _clampPlayerPosition(playerTargetPosition);
+      steering.baseY = y;
+      steering.x = steering.x
+          .clamp(_minShipX, _maxShipX)
+          .toDouble();
+      steering.targetX = steering.targetX.clamp(_minShipX, _maxShipX).toDouble();
     }
+    playerPosition = steering.position;
+    playerTargetPosition = Offset(steering.targetX, steering.baseY);
+    _lastRouteX = steering.x;
     if (_stars.isEmpty) {
       for (var index = 0; index < 95; index++) {
         _stars.add(
@@ -152,52 +195,78 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
     }
   }
 
+  double get _minShipX => playableArea.left + 25;
+  double get _maxShipX => playableArea.right - 25;
+
+  @override
+  void onPanStart(DragStartInfo info) {
+    if (!flow.acceptSteer) return;
+    steering.setDragX(info.eventPosition.widget.x);
+  }
+
   @override
   void onPanUpdate(DragUpdateInfo info) {
-    if (!isPlaying) return;
-    playerTargetPosition = _clampPlayerPosition(info.eventPosition.widget.toOffset());
+    if (!flow.acceptSteer) return;
+    steering.setDragX(info.eventPosition.widget.x);
   }
 
   void start() {
     resetRun();
-    phase = GamePhase.countdown;
-    _countdown = 3.4;
+    flow.startCountdown();
+    _countdown = 3;
     _banner = 'SYSTEMS READY';
     _bannerLife = 1.2;
-    _emit();
+    _transition = 1;
+    audio.play(GameSfx.countdown);
+    analytics.emit(GameAnalyticsEvent.runStart);
+    _emit(force: true);
   }
 
-  void restart() => start();
+  void restart() {
+    analytics.emit(GameAnalyticsEvent.restart);
+    start();
+  }
 
   void returnHome() {
-    phase = GamePhase.home;
-    _emit();
+    flow.enterHome();
+    _emit(force: true);
   }
 
   void requestPause() {
-    if (!isPlaying) return;
-    phase = GamePhase.paused;
-    _emit();
+    if (!flow.requestPause()) return;
+    audio.play(GameSfx.pause);
+    analytics.emit(GameAnalyticsEvent.pause);
+    _emit(force: true);
   }
 
   void resume() {
     if (phase != GamePhase.paused) return;
-    phase = GamePhase.countdown;
+    flow.resumeFromPause();
     _countdown = 2.2;
     _banner = 'READY';
     _bannerLife = 1.0;
-    _emit();
+    clock.armResume();
+    audio.play(GameSfx.resume);
+    analytics.emit(GameAnalyticsEvent.resume);
+    _emit(force: true);
   }
 
   void onAppInactive() {
-    if (isPlaying || phase == GamePhase.countdown) requestPause();
+    if (!flow.onAppInactive()) return;
+    audio.play(GameSfx.pause);
+    _emit(force: true);
   }
 
   Future<void> toggleHaptics() async {
     hapticsEnabled = !hapticsEnabled;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setBool('space_survival_haptics', hapticsEnabled);
-    _emit();
+    _emit(force: true);
+  }
+
+  void toggleDebug() {
+    debugView = !debugView;
+    _emit(force: true);
   }
 
   void debugSpawn(PowerId id) {
@@ -207,13 +276,16 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
 
   void resetRun() {
     difficulty.reset();
+    speed.reset();
+    powers.reset();
+    scoreboard.reset();
+    audio.reset();
     obstacles.clear();
     coins.clear();
     pickups.clear();
     bullets.clear();
     particles.clear();
     floatingTexts.clear();
-    _powers.clear();
     _elapsed = 0;
     _spawnClock = 0;
     _coinClock = 0;
@@ -223,46 +295,58 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
     _impact = 0;
     _banner = '';
     _bannerLife = 0;
-    score = 0;
-    collectedCoins = 0;
-    powersUsed = 0;
     destroyed = 0;
     _newBest = false;
     _worldDistance = 0;
-    _worldSpeed = 220;
     _nextCoinSpawnScrollY = 0;
-    ship = Offset(playableArea.center.dx, playableArea.bottom - playableArea.height * .18);
-    playerTargetPosition = ship;
-    _lastRouteX = ship.dx;
+    _assistPower = null;
+    _lastFair = true;
+    _lastHud = null;
+    final y = size.y > 0
+        ? playableArea.bottom - playableArea.height * .18
+        : 0.0;
+    final x = size.x > 0 ? playableArea.center.dx : 0.0;
+    steering.place(x, y);
+    playerPosition = steering.position;
+    playerTargetPosition = steering.position;
+    _lastRouteX = steering.x;
+    _lastGapWidth = playableArea.width * .31;
   }
 
   @override
   void update(double dt) {
     super.update(dt);
-    final safeDt = dt.clamp(0.0, .05);
+    final safeDt = clock.clamp(dt);
+    _transition = math.max(0, _transition - safeDt * 2.4);
     if (phase == GamePhase.home) {
       _starOffset += safeDt * 8;
       return;
     }
-    if (phase == GamePhase.countdown) {
+    if (phase == GamePhase.countdown || phase == GamePhase.resuming) {
       _starOffset += safeDt * 12;
       _countdown -= safeDt;
       if (_countdown <= 0) {
-        phase = GamePhase.playing;
+        flow.enterPlaying();
         _banner = 'GO';
         _bannerLife = .65;
+        clock.armResume();
+        audio.play(GameSfx.countdown);
         _haptic(HapticFeedback.mediumImpact);
       }
-      _emit();
+      _emit(force: true);
       return;
     }
+    if (phase == GamePhase.paused || phase == GamePhase.gameOver) return;
     if (!isPlaying) return;
 
     _elapsed += safeDt;
-    difficulty.update(_elapsed, safeDt);
+    speed.setSlowTime(powers.has(PowerId.slowTime));
+    speed.setEmp(powers.has(PowerId.emp));
+    speed.update(_elapsed, safeDt);
     _effectSpeed +=
-        (obstacleTargetSpeed - _effectSpeed) * math.min(1, safeDt * 4.4);
+        (speed.worldScrollSpeed - _effectSpeed) * math.min(1, safeDt * 4.4);
     _starOffset += safeDt * (18 + _effectSpeed * .08);
+    scoreboard.tickSurvival(safeDt, powers.scoreMultiplier);
     _updatePowers(safeDt);
     _updateShip(safeDt);
     _updateWorldScroll(safeDt);
@@ -275,55 +359,36 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   }
 
   void _updatePowers(double dt) {
-    final expired = <PowerId>[];
-    for (final active in _powers.values) {
-      active.remaining -= dt;
-      if (active.remaining <= 0) expired.add(active.id);
-    }
+    final expired = powers.update(dt, timersFrozen: flow.timersFrozen);
     for (final id in expired) {
-      _powers.remove(id);
       _banner = '${powerDefinitions[id]!.label} ENDED';
       _bannerLife = .55;
       _burst(ship, powerDefinitions[id]!.color, 8, .5);
     }
-    if (_powers.containsKey(PowerId.gun)) {
+    if (powers.has(PowerId.gun)) {
       _gunClock += dt;
       if (_gunClock > .25) {
         _gunClock = 0;
         _fireBullet();
       }
+    } else {
+      _gunClock = 0;
     }
   }
 
   void _updateShip(double dt) {
-    final smoothing = math.min(1.0, dt * 11);
-    final maxMove = playerSpeed * dt;
-    final delta = playerTargetPosition - playerPosition;
-    final xMove = delta.dx.clamp(-maxMove, maxMove) * smoothing * 1.8;
-    final yMove = delta.dy.clamp(-maxMove, maxMove) * smoothing * 1.8;
-    playerPosition = _clampPlayerPosition(
-      playerPosition.translate(xMove, yMove),
+    steering.update(
+      dt,
+      maxSpeed: playerSpeed,
+      minX: _minShipX,
+      maxX: _maxShipX,
     );
-  }
-
-  Offset _clampPlayerPosition(Offset position) {
-    final bounds = playableArea;
-    const horizontalRadius = 25.0;
-    const verticalRadius = 31.0;
-    return Offset(
-      position.dx.clamp(bounds.left + horizontalRadius, bounds.right - horizontalRadius).toDouble(),
-      position.dy.clamp(bounds.top + verticalRadius, bounds.bottom - verticalRadius).toDouble(),
-    );
+    playerPosition = steering.position;
+    playerTargetPosition = Offset(steering.targetX, steering.baseY);
   }
 
   void _updateWorldScroll(double dt) {
-    final scrollMultiplier = _powers.containsKey(PowerId.slowTime) ? .5 : 1.0;
-
-    _worldSpeed = _powers.containsKey(PowerId.emp)
-        ? 0
-        : difficulty.currentDifficultySpeed * scrollMultiplier;
-
-    _worldDistance += _worldSpeed * dt;
+    _worldDistance += speed.worldScrollSpeed * dt;
   }
 
   void _updateWorld(double dt) {
@@ -345,39 +410,59 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
       _coinClock = 0;
       _spawnCoinTrail();
     }
-    if (_powerClock >= 8.5 && pickups.length < maxPickups) {
+    if (_powerClock >= balance.powerMinInterval &&
+        pickups.length < balance.maxPickups) {
       _powerClock = 0;
       _spawnPickup();
     }
+    final empMotion = speed.empFactor;
     for (final group in obstacles) {
-      group.age += dt;
+      if (empMotion > .04) group.age += dt;
       final lateral = switch (group.type) {
-        ObstacleType.piston => math.sin(group.age * 2.3) * 20 * dt,
-        ObstacleType.splitWall => math.sin(group.age * 1.8) * 9 * dt,
+        ObstacleType.piston => math.sin(group.age * 2.3) * 20 * dt * empMotion,
+        ObstacleType.splitWall => math.sin(group.age * 1.8) * 9 * dt * empMotion,
         _ => 0.0,
       };
-      if (group.type == ObstacleType.rotatingBar) group.rotation += dt * .9;
+      if (group.type == ObstacleType.rotatingBar) {
+        group.rotation += dt * .9 * empMotion;
+      }
       for (final segment in group.segments) {
-        if (lateral != 0) {
-          segment.translateWorld(Offset(lateral, 0));
+        if (lateral != 0) segment.translateWorld(Offset(lateral, 0));
+        if (speed.obstacleHoldSpeed != 0) {
+          segment.translateWorld(Offset(0, speed.obstacleHoldSpeed * dt));
         }
         segment.damageFlash = math.max(0, segment.damageFlash - dt * 2);
       }
     }
     for (final coin in coins) {
       coin.pulse += dt * 5;
+      coin.spawnAge += dt;
       final coinScreen = _worldToScreen(coin.worldPosition);
       final distance = (coinScreen - playerPosition).distance;
-      if (_powers.containsKey(PowerId.magnet) && distance < 190) {
+      if (powers.has(PowerId.turboCollect) &&
+          distance < balance.turboPickupRadius) {
+        final pull = turboCollectVelocity(
+          from: coinScreen,
+          to: playerPosition,
+          pulse: coin.pulse,
+          radius: balance.turboPickupRadius,
+        );
+        coin.translateWorld(pull * dt);
+        coin.turboPull = true;
+        coin.attracting = false;
+      } else if (powers.has(PowerId.magnet) && distance < balance.magnetRadius) {
         final direction = (playerPosition - coinScreen) / math.max(distance, 1);
         coin.translateWorld(direction * 480 * dt);
         coin.attracting = true;
+        coin.turboPull = false;
       } else {
         coin.attracting = false;
+        coin.turboPull = false;
       }
     }
     for (final pickup in pickups) {
       pickup.age += dt;
+      if (pickup.age > 10.5) pickup.alive = false;
     }
     for (final bullet in bullets) {
       bullet.trail += dt;
@@ -392,142 +477,85 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
       text.position = text.position.translate(0, -35 * dt);
       text.life -= dt;
     }
+    _updateExhaust(dt);
     _checkBulletImpacts();
   }
 
+  void _updateExhaust(double dt) {
+    if (speed.difficultySpeed < 300) return;
+    _exhaustClock += dt;
+    if (_exhaustClock < .05) return;
+    _exhaustClock = 0;
+    _burst(
+      playerPosition.translate(0, 28),
+      const Color(0xff4ce7ff),
+      2,
+      .28,
+    );
+  }
+
   void _spawnObstacle() {
-    if (obstacles.length >= maxObstacles || size.x <= 0) return;
-    final phaseIndex = _elapsed < 20
-        ? 0
-        : _elapsed < 60
-        ? 1
-        : _elapsed < 120
-        ? 2
-        : _elapsed < 240
-        ? 3
-        : 4;
-    final candidates = <ObstacleType>[
-      ObstacleType.wall,
-      if (phaseIndex >= 1) ObstacleType.laserGate,
-      if (phaseIndex >= 1) ObstacleType.asteroidCluster,
-      if (phaseIndex >= 2) ObstacleType.mineField,
-      if (phaseIndex >= 2) ObstacleType.piston,
-      if (phaseIndex >= 3) ObstacleType.rotatingBar,
-      if (phaseIndex >= 3) ObstacleType.electricField,
-      if (phaseIndex >= 3) ObstacleType.splitWall,
-      if (phaseIndex >= 4) ObstacleType.zigzag,
-      if (phaseIndex >= 4) ObstacleType.breakableWall,
-    ];
+    if (obstacles.length >= balance.maxObstacles || size.x <= 0) return;
+    final phaseIndex = _phases.phaseIndex(_elapsed);
+    final candidates = _phases.typesFor(phaseIndex);
     final type = candidates[_random.nextInt(candidates.length)];
+    final definition = obstacleDefinitions[type]!;
     const safeMargin =
         PlayabilityValidator.shipWidth + PlayabilityValidator.safetyMargin;
     final bounds = playableArea;
-    final gapWidth = math.max(
-      safeMargin,
-      bounds.width * (_elapsed < 60 ? .31 : .25),
-    );
+    var gapWidth = type == ObstacleType.narrowWindow
+        ? safeMargin + 8
+        : math.max(safeMargin, bounds.width * (_elapsed < 60 ? .31 : .25));
+    gapWidth = math.max(gapWidth, safeMargin);
     final maxRouteShift = math.min(bounds.width * .24, 155 + _elapsed * .12);
     final proposed =
-        (_lastRouteX + (_random.nextDouble() * 2 - 1) * maxRouteShift).clamp(
-          bounds.left + gapWidth / 2 + 18,
-          bounds.right - gapWidth / 2 - 18,
-        ).toDouble();
+        (_lastRouteX + (_random.nextDouble() * 2 - 1) * maxRouteShift)
+            .clamp(
+              bounds.left + gapWidth / 2 + 18,
+              bounds.right - gapWidth / 2 - 18,
+            )
+            .toDouble();
     final spawnScreenY = bounds.top - 90;
     final worldY = _worldYForSpawn(spawnScreenY);
     final distance = playerPosition.dy - spawnScreenY;
-    final gapCenter =
-        validator.isReachable(
-          fromX: _lastRouteX,
-          gapCenter: proposed,
-          gapWidth: gapWidth,
-          distance: distance,
-          speed: math.max(_effectSpeed, 100),
-        )
-        ? proposed
-        : _lastRouteX;
+    final lookSpeed = math.max(speed.worldScrollSpeed, 100.0);
+    final fromLast = validator.validateReachability(
+      fromX: _lastRouteX,
+      gapCenter: proposed,
+      gapWidth: gapWidth,
+      distance: distance,
+      speed: lookSpeed,
+    );
+    final fromShip = validator.validateReachability(
+      fromX: steering.x,
+      gapCenter: proposed,
+      gapWidth: gapWidth,
+      distance: distance,
+      speed: lookSpeed,
+    );
+    final gapCenter = fromLast && fromShip ? proposed : _lastRouteX;
+    _lastFair = validator.validateReachability(
+      fromX: _lastRouteX,
+      gapCenter: gapCenter,
+      gapWidth: gapWidth,
+      distance: distance,
+      speed: lookSpeed,
+    );
     _lastRouteX = gapCenter;
-    const maxWallWidth = 78.0;
-    const wallHeight = 40.0;
-    final segments = <ObstacleSegment>[];
-    final material = switch (type) {
-      ObstacleType.laserGate => ObstacleMaterial.laser,
-      ObstacleType.asteroidCluster ||
-      ObstacleType.mineField => ObstacleMaterial.asteroid,
-      ObstacleType.electricField => ObstacleMaterial.electric,
-      ObstacleType.breakableWall => ObstacleMaterial.crystal,
-      _ => ObstacleMaterial.metal,
-    };
-    final health = type == ObstacleType.breakableWall ? 2 : 1;
-    final left = gapCenter - gapWidth / 2;
-    final right = gapCenter + gapWidth / 2;
-    if (type == ObstacleType.asteroidCluster ||
-        type == ObstacleType.mineField) {
-      for (final x in [
-        bounds.left + bounds.width * .13,
-        bounds.left + bounds.width * .33,
-        bounds.left + bounds.width * .67,
-        bounds.left + bounds.width * .87,
-      ]) {
-        if ((x - gapCenter).abs() > gapWidth * .35) {
-          final radius = type == ObstacleType.mineField
-              ? 17.0
-              : 22 + _random.nextDouble() * 11;
-          segments.add(
-            ObstacleSegment(
-              Rect.fromCenter(
-                center: Offset(x, worldY + _random.nextDouble() * 38),
-                width: radius * 2,
-                height: radius * 2,
-              ),
-              material: material,
-              health: 1,
-            ),
-          );
-        }
-      }
-    } else if (type == ObstacleType.rotatingBar) {
-      segments.add(
-        ObstacleSegment(
-          Rect.fromCenter(
-            center: Offset(gapCenter, worldY),
-            width: bounds.width * .38,
-            height: 22,
-          ),
-          material: ObstacleMaterial.energy,
-          health: 1,
-        ),
-      );
-    } else {
-      final leftWidth = math.min(maxWallWidth, left - bounds.left - 12);
-      if (leftWidth > 14) {
-        segments.add(
-          ObstacleSegment(
-            Rect.fromLTWH(left - leftWidth, worldY, leftWidth, wallHeight),
-            material: material,
-            health: health,
-          ),
-        );
-      }
-      final rightWidth = math.min(maxWallWidth, bounds.right - right - 12);
-      if (rightWidth > 14) {
-        segments.add(
-          ObstacleSegment(
-            Rect.fromLTWH(right, worldY, rightWidth, wallHeight),
-            material: material,
-            health: health,
-          ),
-        );
-      }
-      if (type == ObstacleType.electricField) {
-        segments.add(
-          ObstacleSegment(
-            Rect.fromLTWH(left - 7, worldY - 14, gapWidth + 14, 10),
-            material: ObstacleMaterial.electric,
-            health: 1,
-          ),
-        );
-      }
-    }
+    _lastGapWidth = gapWidth;
+    final health = definition.minHealth +
+        (definition.maxHealth > definition.minHealth && _random.nextBool()
+            ? 1
+            : 0);
+    final segments = _buildSegments(
+      type: type,
+      definition: definition,
+      bounds: bounds,
+      gapCenter: gapCenter,
+      gapWidth: gapWidth,
+      worldY: worldY,
+      health: health.clamp(definition.minHealth, definition.maxHealth),
+    );
     obstacles.add(
       ObstacleGroup(
         type: type,
@@ -536,6 +564,172 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
         spawnY: worldY,
       ),
     );
+    if (type == ObstacleType.breakableWall) {
+      _assistPower = PowerId.gun;
+    } else if (type == ObstacleType.asteroidCluster && _random.nextBool()) {
+      _assistPower = PowerId.magnet;
+    }
+  }
+
+  List<ObstacleSegment> _buildSegments({
+    required ObstacleType type,
+    required ObstacleDefinition definition,
+    required Rect bounds,
+    required double gapCenter,
+    required double gapWidth,
+    required double worldY,
+    required int health,
+  }) {
+    final segments = <ObstacleSegment>[];
+    const maxWallWidth = 78.0;
+    final wallHeight = type == ObstacleType.laserGate ? 64.0 : 40.0;
+    final left = gapCenter - gapWidth / 2;
+    final right = gapCenter + gapWidth / 2;
+
+    ObstacleSegment make(Rect rect, {ObstacleMaterial? material, int? hp}) {
+      final segment = _segmentPool.acquire(
+        () => ObstacleSegment(
+          rect,
+          material: material ?? definition.material,
+          health: hp ?? health,
+        ),
+      );
+      segment.recycle(
+        rect,
+        material: material ?? definition.material,
+        health: hp ?? health,
+        maxHealth: definition.maxHealth,
+      );
+      return segment;
+    }
+
+    if (type == ObstacleType.asteroidCluster || type == ObstacleType.mineField) {
+      for (final x in [
+        bounds.left + bounds.width * .13,
+        bounds.left + bounds.width * .33,
+        bounds.left + bounds.width * .67,
+        bounds.left + bounds.width * .87,
+      ]) {
+        if ((x - gapCenter).abs() > gapWidth * .38) {
+          final radius = type == ObstacleType.mineField
+              ? 17.0
+              : 22 + _random.nextDouble() * 11;
+          segments.add(
+            make(
+              Rect.fromCenter(
+                center: Offset(x, worldY + _random.nextDouble() * 38),
+                width: radius * 2,
+                height: radius * 2,
+              ),
+              hp: 1,
+            ),
+          );
+        }
+      }
+      return segments;
+    }
+
+    if (type == ObstacleType.rotatingBar) {
+      final wallLeftWidth = math.max(20.0, left - bounds.left);
+      final onLeft = wallLeftWidth >= (bounds.right - right);
+      final pivotX = onLeft ? left - math.min(40, wallLeftWidth / 2) : right + 36;
+      segments.add(
+        make(
+          Rect.fromCenter(
+            center: Offset(pivotX, worldY),
+            width: math.min(bounds.width * .28, 92),
+            height: 18,
+          ),
+          hp: 1,
+        ),
+      );
+      return segments;
+    }
+
+    if (type == ObstacleType.zigzag) {
+      for (var row = 0; row < 2; row++) {
+        final y = worldY + row * 58;
+        final leftBias = row == 0 ? 18.0 : 0.0;
+        final rightBias = row == 0 ? 0.0 : 18.0;
+        final leftWidth = math.min(
+          maxWallWidth + leftBias,
+          left - bounds.left - 12,
+        );
+        if (leftWidth > 14) {
+          segments.add(make(Rect.fromLTWH(left - leftWidth, y, leftWidth, 28)));
+        }
+        final rightWidth = math.min(
+          maxWallWidth + rightBias,
+          bounds.right - right - 12,
+        );
+        if (rightWidth > 14) {
+          segments.add(make(Rect.fromLTWH(right, y, rightWidth, 28)));
+        }
+      }
+      return segments;
+    }
+
+    if (type == ObstacleType.splitWall) {
+      final extraGap = math.max(
+        PlayabilityValidator.shipWidth + PlayabilityValidator.safetyMargin,
+        gapWidth * .72,
+      );
+      final leftGap = gapCenter - extraGap * .7;
+      final rightGap = gapCenter + extraGap * .7;
+      final splitterWidth = 28.0;
+      final leftInner = leftGap - extraGap / 2;
+      final rightInner = rightGap + extraGap / 2;
+      final leftWidth = math.min(maxWallWidth, leftInner - bounds.left - 8);
+      if (leftWidth > 14) {
+        segments.add(
+          make(Rect.fromLTWH(leftInner - leftWidth, worldY, leftWidth, wallHeight)),
+        );
+      }
+      segments.add(
+        make(
+          Rect.fromCenter(
+            center: Offset(gapCenter, worldY + wallHeight / 2),
+            width: splitterWidth,
+            height: wallHeight,
+          ),
+        ),
+      );
+      final rightWidth = math.min(maxWallWidth, bounds.right - rightInner - 8);
+      if (rightWidth > 14) {
+        segments.add(
+          make(Rect.fromLTWH(rightInner, worldY, rightWidth, wallHeight)),
+        );
+      }
+      return segments;
+    }
+
+    final leftWidth = math.min(maxWallWidth, left - bounds.left - 12);
+    if (leftWidth > 14) {
+      segments.add(
+        make(
+          Rect.fromLTWH(
+            left - leftWidth,
+            worldY,
+            type == ObstacleType.laserGate ? math.min(18, leftWidth) : leftWidth,
+            wallHeight,
+          ),
+        ),
+      );
+    }
+    final rightWidth = math.min(maxWallWidth, bounds.right - right - 12);
+    if (rightWidth > 14) {
+      segments.add(
+        make(
+          Rect.fromLTWH(
+            right,
+            worldY,
+            type == ObstacleType.laserGate ? math.min(18, rightWidth) : rightWidth,
+            wallHeight,
+          ),
+        ),
+      );
+    }
+    return segments;
   }
 
   bool _coinPositionIsValid(
@@ -544,86 +738,54 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
     Iterable<Rect> blockedRects,
   ) {
     for (final position in existing) {
-      if ((candidate - position).distance < minimumCoinDistance) {
-        return false;
-      }
+      if ((candidate - position).distance < minimumCoinDistance) return false;
     }
-
     final candidateRect = Rect.fromCircle(
       center: candidate,
       radius: coinRadius + 5,
     );
-
     for (final blocked in blockedRects) {
-      if (candidateRect.overlaps(blocked)) {
-        return false;
-      }
+      if (candidateRect.overlaps(blocked)) return false;
     }
-
     return true;
   }
 
   void _spawnCoinTrail() {
-    if (coins.length >= maxCoins || size.x <= 0) return;
-
+    if (coins.length >= balance.maxCoins || size.x <= 0) return;
     final pattern = _nextCoinPattern();
     final offsets = _coinPlanner.offsetsFor(pattern);
     final bounds = playableArea.deflate(coinRadius + 10);
-
     final minX = offsets.map((offset) => offset.dx).reduce(math.min);
     final maxX = offsets.map((offset) => offset.dx).reduce(math.max);
     final patternDepth = _coinPlanner.patternDepth(pattern);
-
     final spawnScreenY = bounds.top - patternDepth - 50;
     final anchorWorldY = _worldYForSpawn(spawnScreenY);
-
     final existing = coins
         .where((coin) => coin.alive)
         .map((coin) => coin.worldPosition)
         .toList(growable: false);
-
     final blockedRects = _blockedCoinRects();
-
     for (var attempt = 0; attempt < 12; attempt++) {
       final routeVariation =
           (_random.nextDouble() * 2 - 1) * math.min(100, 35 + _elapsed * .2);
-
       final anchorX = (_lastRouteX + routeVariation)
-          .clamp(
-            bounds.left - minX,
-            bounds.right - maxX,
-          )
+          .clamp(bounds.left - minX, bounds.right - maxX)
           .toDouble();
-
       final anchor = Offset(anchorX, anchorWorldY);
       final positions = offsets.map((offset) => anchor + offset).toList();
-
       final valid = positions.every(
-        (position) => _coinPositionIsValid(
-          position,
-          existing,
-          blockedRects,
-        ),
+        (position) => _coinPositionIsValid(position, existing, blockedRects),
       );
-
       if (!valid) continue;
-
       for (final position in positions) {
-        if (coins.length >= maxCoins) break;
-
-        coins.add(
-          Coin(
-            Rect.fromCircle(
-              center: position,
-              radius: coinRadius,
-            ),
-          ),
-        );
+        if (coins.length >= balance.maxCoins) break;
+        final rect = Rect.fromCircle(center: position, radius: coinRadius);
+        final coin = _coinPool.acquire(() => Coin(rect));
+        coin.recycle(rect);
+        coins.add(coin);
       }
-
       _nextCoinSpawnScrollY =
           _worldDistance + patternDepth + minimumCoinDistance * 2;
-
       return;
     }
   }
@@ -645,73 +807,52 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
     return patterns[_random.nextInt(patterns.length)];
   }
 
-  void _spawnPickup() {
-    final id = _pickPower();
-    final bounds = playableArea.deflate(20);
-    final x = _lastRouteX.clamp(bounds.left, bounds.right).toDouble();
+  void _spawnPickup({PowerId? forced}) {
+    if (pickups.length >= balance.maxPickups || size.x <= 0) return;
+    final id = forced ?? _assistPower ?? _rarity.pick(_random, _elapsed);
+    _assistPower = null;
+    final bounds = playableArea.deflate(
+      playableArea.width * balance.edgeMarginFactor,
+    );
     final spawnScreenY = bounds.top - 48;
     final worldY = _worldYForSpawn(spawnScreenY);
-    final candidate = Rect.fromCenter(
-      center: Offset(x, worldY),
-      width: 34,
-      height: 34,
-    );
-    final candidateScreen = _worldRectToScreen(candidate);
-    if (obstacles.any(
-      (group) => group.segments.any(
-        (segment) =>
-            segment.alive &&
-            _worldRectToScreen(segment.worldRect).overlaps(candidateScreen),
-      ),
-    )) {
+    final blocked = _blockedCoinRects();
+    for (var attempt = 0; attempt < 10; attempt++) {
+      final jitter = (_random.nextDouble() * 2 - 1) * 42;
+      final x = (_lastRouteX + jitter).clamp(bounds.left, bounds.right).toDouble();
+      final candidate = Rect.fromCenter(
+        center: Offset(x, worldY),
+        width: 34,
+        height: 34,
+      );
+      if (blocked.any((rect) => rect.inflate(12).overlaps(candidate))) continue;
+      if (!validator.validateReachability(
+        fromX: steering.x,
+        gapCenter: x,
+        gapWidth: 90,
+        distance: playerPosition.dy - spawnScreenY,
+        speed: math.max(speed.worldScrollSpeed, 100.0),
+      )) {
+        continue;
+      }
+      final pickup = _pickupPool.acquire(() => PowerPickup(candidate, id));
+      pickup.recycle(candidate, id);
+      pickups.add(pickup);
       return;
     }
-    if (!validator.isReachable(
-      fromX: playerPosition.dx,
-      gapCenter: x,
-      gapWidth: 90,
-      distance: playerPosition.dy - spawnScreenY,
-      speed: math.max(_effectSpeed, 100),
-    )) {
-      return;
-    }
-    pickups.add(PowerPickup(candidate, id));
-  }
-
-  PowerId _pickPower() {
-    final seconds = _elapsed;
-    final candidates = <(PowerId, int)>[
-      (PowerId.magnet, 25),
-      (PowerId.shield, 25),
-      (PowerId.gun, 15),
-      (PowerId.slowTime, 15),
-      (PowerId.invisibility, 10),
-      (PowerId.doubleScore, 7 + (seconds ~/ 90)),
-      (PowerId.coinMultiplier, 7 + (seconds ~/ 90)),
-      (PowerId.emp, 6 + (seconds ~/ 120)),
-      (PowerId.phaseDash, 3 + (seconds ~/ 120)),
-      (PowerId.turboCollect, 3 + (seconds ~/ 120)),
-    ];
-    final total = candidates.fold<int>(0, (sum, entry) => sum + entry.$2);
-    var ticket = _random.nextInt(total);
-    for (final item in candidates) {
-      ticket -= item.$2;
-      if (ticket < 0) return item.$1;
-    }
-    return PowerId.magnet;
   }
 
   void _fireBullet() {
-    if (bullets.length >= maxBullets) return;
-    bullets.add(
-      Bullet(
-        Rect.fromCenter(
-          center: playerPosition.translate(0, -33),
-          width: 6,
-          height: 18,
-        ),
-      ),
+    if (bullets.length >= balance.maxBullets) return;
+    final rect = Rect.fromCenter(
+      center: playerPosition.translate(0, -33),
+      width: 6,
+      height: 18,
     );
+    final bullet = _bulletPool.acquire(() => Bullet(rect));
+    bullet.recycle(rect);
+    bullets.add(bullet);
+    audio.play(GameSfx.gun);
     _burst(playerPosition.translate(0, -30), const Color(0xffffa25f), 3, .28);
   }
 
@@ -719,8 +860,13 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
     for (final bullet in bullets.where((item) => item.alive).toList()) {
       for (final group in obstacles) {
         for (final segment in group.segments.where((item) => item.alive)) {
+          final definition = obstacleDefinitions[group.type];
+          if (definition?.destructible == false) continue;
           final segmentScreen = _worldRectToScreen(segment.worldRect);
-          if (bullet.rect.overlaps(segmentScreen)) {
+          final hit = group.type == ObstacleType.rotatingBar
+              ? rotatedRectOverlaps(segmentScreen, group.rotation, bullet.rect)
+              : bullet.rect.overlaps(segmentScreen);
+          if (hit) {
             bullet.alive = false;
             segment.health--;
             segment.damageFlash = .35;
@@ -736,7 +882,7 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
               _burst(
                 Offset(segmentScreen.center.dx, segmentScreen.center.dy),
                 materialColor(segment.material),
-                15,
+                16,
                 .7,
               );
             }
@@ -748,20 +894,28 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   }
 
   void _checkCollisions() {
-    final shipRect = Rect.fromCenter(center: playerPosition, width: 40, height: 48);
+    final shipRect = Rect.fromCenter(
+      center: playerPosition,
+      width: 40,
+      height: 48,
+    );
     for (final group in obstacles) {
       for (final segment in group.segments.where(
         (item) => item.alive && item.dangerous,
       )) {
         final segmentScreen = _worldRectToScreen(segment.worldRect);
-        if (shipRect.overlaps(segmentScreen)) {
-          if (invulnerable) continue;
-          if (hasShield) {
-            _powers.remove(PowerId.shield);
+        final hit = group.type == ObstacleType.rotatingBar
+            ? rotatedRectOverlaps(segmentScreen, group.rotation, shipRect)
+            : shipRect.overlaps(segmentScreen);
+        if (hit) {
+          final result = powers.resolveHazardHit();
+          if (result == CollisionResult.ignored) continue;
+          if (result == CollisionResult.shieldBreak) {
             _impact = 1;
             _banner = 'SHIELD BROKEN';
             _bannerLife = 1;
             _burst(playerPosition, const Color(0xff39efd1), 28, .8);
+            audio.play(GameSfx.shieldBreak);
             _haptic(HapticFeedback.heavyImpact);
             segment.alive = false;
             return;
@@ -775,11 +929,13 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
                 .distance;
         if (!group.nearMissReported &&
             distance < 72 &&
-            !shipRect.overlaps(segmentScreen)) {
+            !hit) {
           group.nearMissReported = true;
           _banner = 'NEAR MISS';
           _bannerLife = .45;
           _impact = .25;
+          audio.play(GameSfx.nearMiss);
+          _burst(playerPosition, const Color(0xff9be7ff), 6, .3);
         }
       }
     }
@@ -802,46 +958,55 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   void _collectCoin(Coin coin, Offset coinScreen) {
     if (!coin.alive) return;
     coin.alive = false;
-    collectedCoins++;
-    final gained = (coinMultiplier * scoreMultiplier).round();
-    score += gained;
-    if (floatingTexts.length < 9) {
+    final gained = scoreboard.collectCoin(
+      coinMultiplier: powers.coinMultiplier,
+      scoreMultiplier: powers.scoreMultiplier,
+    );
+    if (floatingTexts.length < balance.maxFloatingTexts) {
       floatingTexts.add(
-        FloatingText(
-          '+$gained',
-          coinScreen,
-          const Color(0xffffdc52),
-        ),
+        FloatingText('+$gained', coinScreen, const Color(0xffffdc52)),
       );
     }
     _burst(coinScreen, const Color(0xffffd74d), 5, .35);
+    audio.play(GameSfx.coin);
     _haptic(HapticFeedback.selectionClick);
   }
 
   void activatePower(PowerId id) {
+    powers.activate(id);
     final definition = powerDefinitions[id]!;
-    _powers[id] = ActivePower(id, definition.duration);
-    powersUsed++;
     _banner = definition.label;
     _bannerLife = 1.2;
     _burst(ship, definition.color, 18, .65);
+    audio.play(id == PowerId.emp ? GameSfx.emp : GameSfx.power);
+    analytics.emit(GameAnalyticsEvent.powerPickup, {'id': id.name});
     _haptic(HapticFeedback.mediumImpact);
+    speed.setSlowTime(powers.has(PowerId.slowTime));
+    speed.setEmp(powers.has(PowerId.emp));
   }
 
   void _gameOver() {
-    phase = GamePhase.gameOver;
-    score += (_elapsed * scoreMultiplier).floor();
-    _newBest = score > bestScore;
+    flow.enterGameOver();
+    scoreboard.frozen = true;
+    _newBest = scoreboard.total > bestScore;
     if (_newBest) {
-      bestScore = score;
+      bestScore = scoreboard.total;
       if (_loadedStorage) unawaited(_saveBest());
+      audio.play(GameSfx.highScore);
+    } else {
+      audio.play(GameSfx.death);
     }
     _impact = 1;
     _banner = _newBest ? 'NEW BEST!' : 'RUN COMPLETE';
     _bannerLife = 1.8;
     _burst(ship, const Color(0xffff735a), 38, 1.1);
+    analytics.emit(GameAnalyticsEvent.death, {
+      'score': scoreboard.total,
+      'elapsed': _elapsed,
+    });
+    analytics.emit(GameAnalyticsEvent.runEnd, {'score': scoreboard.total});
     _haptic(HapticFeedback.heavyImpact);
-    _emit();
+    _emit(force: true);
   }
 
   Future<void> _saveBest() async {
@@ -851,52 +1016,64 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
 
   void _cleanup() {
     final bottomLimit = playableArea.bottom + 60;
-
-    obstacles.removeWhere(
-      (group) => group.segments.every(
+    obstacles.removeWhere((group) {
+      final gone = group.segments.every(
         (segment) =>
             !segment.alive ||
             _worldRectToScreen(segment.worldRect).top > bottomLimit,
-      ),
-    );
-
-    coins.removeWhere(
-      (coin) =>
-          !coin.alive ||
-          _worldToScreen(coin.worldPosition).dy > bottomLimit,
-    );
-
-    pickups.removeWhere(
-      (pickup) =>
+      );
+      if (gone) {
+        for (final segment in group.segments) {
+          _segmentPool.release(segment);
+        }
+      }
+      return gone;
+    });
+    coins.removeWhere((coin) {
+      final gone =
+          !coin.alive || _worldToScreen(coin.worldPosition).dy > bottomLimit;
+      if (gone) _coinPool.release(coin);
+      return gone;
+    });
+    pickups.removeWhere((pickup) {
+      final gone =
           !pickup.alive ||
-          _worldRectToScreen(pickup.worldRect).top > bottomLimit,
-    );
-
-    bullets.removeWhere(
-      (bullet) => !bullet.alive || bullet.rect.bottom < -30,
-    );
-
-    particles.removeWhere((particle) => particle.life <= 0);
+          _worldRectToScreen(pickup.worldRect).top > bottomLimit;
+      if (gone) _pickupPool.release(pickup);
+      return gone;
+    });
+    bullets.removeWhere((bullet) {
+      final gone = !bullet.alive || bullet.rect.bottom < -30;
+      if (gone) _bulletPool.release(bullet);
+      return gone;
+    });
+    particles.removeWhere((particle) {
+      final gone = particle.life <= 0;
+      if (gone) _particlePool.release(particle);
+      return gone;
+    });
     floatingTexts.removeWhere((text) => text.life <= 0);
   }
 
   void _burst(Offset origin, Color color, int count, double life) {
     for (
       var index = 0;
-      index < count && particles.length < maxParticles;
+      index < count && particles.length < balance.maxParticles;
       index++
     ) {
       final angle = _random.nextDouble() * math.pi * 2;
       final velocity = 55 + _random.nextDouble() * 145;
-      particles.add(
-        Particle(
-          origin,
-          Offset(math.cos(angle) * velocity, math.sin(angle) * velocity),
-          color,
-          life,
-          size: 2 + _random.nextDouble() * 3,
-        ),
+      final particle = _particlePool.acquire(
+        () => Particle(origin, Offset.zero, color, life),
       );
+      particle.recycle(
+        origin,
+        Offset(math.cos(angle) * velocity, math.sin(angle) * velocity),
+        color,
+        life,
+        nextSize: 2 + _random.nextDouble() * 3,
+      );
+      particles.add(particle);
     }
   }
 
@@ -904,27 +1081,27 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
     if (hapticsEnabled) unawaited(feedback());
   }
 
-  void _emit() {
-    onSnapshot(
-      GameSnapshot(
-        phase: phase,
-        score: displayedScore,
-        coins: collectedCoins,
-        elapsed: _elapsed,
-        bestScore: bestScore,
-        speed: _effectSpeed,
-        activePowers: _powers.values
-            .map((power) => ActivePower(power.id, power.remaining))
-            .toList(growable: false),
-        powersUsed: powersUsed,
-        destroyed: destroyed,
-        newBest: _newBest,
-        countdown: phase == GamePhase.countdown
-            ? (_countdown > .35 ? _countdown.ceil().toString() : 'GO')
-            : '',
-        banner: _bannerLife > 0 ? _banner : '',
-      ),
+  void _emit({bool force = false}) {
+    final next = GameSnapshot(
+      phase: phase,
+      score: displayedScore,
+      coins: collectedCoins,
+      elapsed: _elapsed,
+      bestScore: bestScore,
+      speed: _effectSpeed,
+      activePowers: powers.snapshot(),
+      powersUsed: powersUsed,
+      destroyed: destroyed,
+      newBest: _newBest,
+      countdown: phase == GamePhase.countdown || phase == GamePhase.resuming
+          ? _countdownLabel
+          : '',
+      banner: _bannerLife > 0 ? _banner : '',
+      hapticsEnabled: hapticsEnabled,
     );
+    if (!force && _lastHud != null && next.sameHud(_lastHud!)) return;
+    _lastHud = next;
+    onSnapshot(next);
   }
 
   @override
@@ -934,22 +1111,22 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
     canvas.drawRect(screen, Paint()..color = const Color(0xff050914));
     _drawStars(canvas);
     _drawAtmosphere(canvas);
-    for (final group in obstacles) {
-      _drawObstacle(canvas, group);
+    for (final particle in particles) {
+      _drawParticle(canvas, particle);
     }
     for (final coin in coins) {
       _drawCoin(canvas, coin);
     }
-    for (final pickup in pickups) {
-      _drawPickup(canvas, pickup);
-    }
     for (final bullet in bullets) {
       _drawBullet(canvas, bullet);
     }
-    for (final particle in particles) {
-      _drawParticle(canvas, particle);
+    for (final pickup in pickups) {
+      _drawPickup(canvas, pickup);
     }
     _drawShip(canvas);
+    for (final group in obstacles) {
+      _drawObstacle(canvas, group);
+    }
     for (final text in floatingTexts) {
       _drawText(
         canvas,
@@ -971,13 +1148,52 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
         opacity: math.min(1, _bannerLife * 2),
       );
     }
+    if (debugView && isPlaying) _drawFairnessOverlay(canvas);
+    _drawLetterbox(canvas);
+    if (_transition > 0) {
+      canvas.drawRect(
+        screen,
+        Paint()..color = Color.fromRGBO(5, 9, 20, _transition),
+      );
+    }
+  }
+
+  void _drawLetterbox(Canvas canvas) {
+    final view = viewRect;
+    if (view.left <= 1) return;
+    final paint = Paint()..color = const Color(0xff02050c);
+    canvas.drawRect(Rect.fromLTWH(0, 0, view.left, size.y), paint);
+    canvas.drawRect(
+      Rect.fromLTWH(view.right, 0, size.x - view.right, size.y),
+      paint,
+    );
+  }
+
+  void _drawFairnessOverlay(Canvas canvas) {
+    final y0 = playableArea.top;
+    final y1 = playableArea.bottom;
+    canvas.drawLine(
+      Offset(_lastRouteX, y0),
+      Offset(_lastRouteX, y1),
+      Paint()
+        ..color = const Color(0x6639efd1)
+        ..strokeWidth = 1.2,
+    );
+    canvas.drawLine(
+      Offset(_lastRouteX - _lastGapWidth / 2, y0 + 40),
+      Offset(_lastRouteX + _lastGapWidth / 2, y0 + 40),
+      Paint()
+        ..color = const Color(0x99ffe27a)
+        ..strokeWidth = 2,
+    );
   }
 
   void _drawStars(Canvas canvas) {
     for (var index = 0; index < _stars.length; index++) {
       final seed = _stars[index];
       final layer = index % 3;
-      final y = (seed.dy + _starOffset * (layer + 1) * .15) % size.y;
+      final parallax = (layer + 1) * (.12 + _effectSpeed / 2400);
+      final y = (seed.dy + _starOffset * parallax) % size.y;
       final opacity = .2 + layer * .13;
       canvas.drawCircle(
         Offset(seed.dx, y),
@@ -989,29 +1205,18 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
 
   void _drawAtmosphere(Canvas canvas) {
     final area = playableArea;
-
     final paint = Paint()
       ..shader = const LinearGradient(
-        colors: [
-          Color(0xff0b1630),
-          Color(0x000b1630),
-        ],
+        colors: [Color(0xff0b1630), Color(0x000b1630)],
         begin: Alignment.topCenter,
         end: Alignment.bottomCenter,
       ).createShader(area);
-
     canvas.drawRect(area, paint);
-
     final linePaint = Paint()
       ..color = const Color(0xff2d76a9).withValues(alpha: .08)
       ..strokeWidth = 1;
-
     for (var y = area.top; y < area.bottom; y += 110) {
-      canvas.drawLine(
-        Offset(area.left, y),
-        Offset(area.right, y),
-        linePaint,
-      );
+      canvas.drawLine(Offset(area.left, y), Offset(area.right, y), linePaint);
     }
   }
 
@@ -1029,21 +1234,14 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
         ..color = color.withValues(alpha: .16)
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 9);
       canvas.drawRRect(
-        RRect.fromRectAndRadius(
-          screenRect.inflate(3),
-          const Radius.circular(6),
-        ),
+        RRect.fromRectAndRadius(screenRect.inflate(3), const Radius.circular(6)),
         glow,
       );
       final paint = Paint()
         ..color = color.withValues(alpha: segment.damageFlash > 0 ? 1 : .82);
       if (group.type == ObstacleType.asteroidCluster ||
           group.type == ObstacleType.mineField) {
-        canvas.drawCircle(
-          screenRect.center,
-          screenRect.width / 2,
-          paint,
-        );
+        canvas.drawCircle(screenRect.center, screenRect.width / 2, paint);
         canvas.drawCircle(
           screenRect.center,
           screenRect.width / 2 + 5 + math.sin(group.age * 5) * 2,
@@ -1051,6 +1249,19 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
             ..color = color.withValues(alpha: .24)
             ..style = PaintingStyle.stroke
             ..strokeWidth = 1.3,
+        );
+      } else if (group.type == ObstacleType.laserGate) {
+        canvas.drawRRect(
+          RRect.fromRectAndRadius(screenRect, const Radius.circular(8)),
+          paint,
+        );
+        canvas.drawRect(
+          Rect.fromCenter(
+            center: screenRect.center,
+            width: 4,
+            height: screenRect.height + 10,
+          ),
+          Paint()..color = const Color(0xfffff1f6).withValues(alpha: .55),
         );
       } else {
         canvas.drawRRect(
@@ -1064,14 +1275,35 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
             ..color = const Color(0xffe5f7ff).withValues(alpha: .3)
             ..strokeWidth = 1,
         );
-        if (segment.health > 1) {
+        if (segment.crackStage >= 1) {
+          final crack = Paint()
+            ..color = const Color(0xff09111e).withValues(alpha: .55)
+            ..strokeWidth = 1.4;
           canvas.drawLine(
-            screenRect.centerLeft + const Offset(7, 0),
-            screenRect.centerRight - const Offset(7, 0),
-            Paint()
-              ..color = const Color(0xff09111e).withValues(alpha: .42)
-              ..strokeWidth = 2,
+            screenRect.topLeft + Offset(8, screenRect.height * .35),
+            screenRect.bottomRight - Offset(10, screenRect.height * .2),
+            crack,
           );
+          if (segment.crackStage >= 2) {
+            canvas.drawLine(
+              screenRect.topCenter + const Offset(0, 4),
+              screenRect.bottomLeft + const Offset(12, -4),
+              crack,
+            );
+          }
+        }
+        if (group.type == ObstacleType.electricField) {
+          final zap = Paint()
+            ..color = const Color(0xffd7b8ff).withValues(alpha: .7)
+            ..strokeWidth = 1.2;
+          for (var i = 0; i < 3; i++) {
+            final y = screenRect.top + 8 + i * 10;
+            canvas.drawLine(
+              Offset(screenRect.left + 4, y),
+              Offset(screenRect.right - 4, y + math.sin(group.age * 12 + i) * 4),
+              zap,
+            );
+          }
         }
       }
       canvas.restore();
@@ -1080,7 +1312,9 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
 
   void _drawCoin(Canvas canvas, Coin coin) {
     final center = _worldToScreen(coin.worldPosition);
-    final radius = coin.rect.width / 2 * (1 + math.sin(coin.pulse) * .06);
+    final appear = math.min(1, coin.spawnAge * 6);
+    final radius =
+        coin.rect.width / 2 * (1 + math.sin(coin.pulse) * .06) * appear;
     canvas.drawCircle(
       center,
       radius + 4,
@@ -1103,23 +1337,24 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
       math.sin(pickup.age * 3) * 3,
     );
     final scale = math.min(1, pickup.age * 4).toDouble();
+    final fade = pickup.age > 9 ? (10.5 - pickup.age).clamp(0.0, 1.0) : 1.0;
     canvas.drawCircle(
       center,
       24 * scale,
       Paint()
-        ..color = definition.color.withValues(alpha: .14)
+        ..color = definition.color.withValues(alpha: .14 * fade)
         ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 12),
     );
     canvas.drawCircle(
       center,
       17 * scale,
-      Paint()..color = const Color(0xff111b2e),
+      Paint()..color = const Color(0xff111b2e).withValues(alpha: fade),
     );
     canvas.drawCircle(
       center,
       17 * scale,
       Paint()
-        ..color = definition.color.withValues(alpha: .9)
+        ..color = definition.color.withValues(alpha: .9 * fade)
         ..style = PaintingStyle.stroke
         ..strokeWidth = 2,
     );
@@ -1127,7 +1362,7 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
       canvas,
       definition.symbol,
       center,
-      definition.color,
+      definition.color.withValues(alpha: fade),
       pickup.id == PowerId.doubleScore || pickup.id == PowerId.coinMultiplier
           ? 11
           : 19,
@@ -1157,19 +1392,22 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   }
 
   void _drawShip(Canvas canvas) {
-    if (playerPosition == Offset.zero) return;
-    final opacity = invulnerable ? .48 : 1.0;
-    final shift =
-        (playerTargetPosition.dx - playerPosition.dx).clamp(-45, 45) / 45;
+    if (playerPosition == Offset.zero && size.x <= 0) return;
+    final opacity = powers.dashing
+        ? .38
+        : powers.cloaked
+        ? .48
+        : 1.0;
+    final shift = (steering.targetX - steering.x).clamp(-45, 45) / 45;
     canvas.save();
     canvas.translate(
       playerPosition.dx,
       playerPosition.dy + math.sin(_elapsed * 3.2) * 2,
     );
     canvas.rotate(shift * .16);
-    final flameLength = 20 + difficulty.currentDifficultySpeed / 55;
+    final flameLength = 20 + speed.difficultySpeed / 55;
     canvas.drawOval(
-      Rect.fromCenter(center: Offset(0, 30), width: 13, height: flameLength),
+      Rect.fromCenter(center: const Offset(0, 30), width: 13, height: flameLength),
       Paint()..color = const Color(0xff2de3ff).withValues(alpha: .3),
     );
     final shipPath = Path()
@@ -1214,7 +1452,7 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
           ..strokeWidth = 5,
       );
     }
-    if (_powers.containsKey(PowerId.magnet)) {
+    if (powers.has(PowerId.magnet)) {
       canvas.drawCircle(
         Offset.zero,
         58 + math.sin(_elapsed * 5) * 4,
@@ -1259,7 +1497,7 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
       ),
       textDirection: TextDirection.ltr,
       textAlign: center ? TextAlign.center : TextAlign.left,
-    )..layout(maxWidth: size.x - 20);
+    )..layout(maxWidth: math.max(20, size.x - 20));
     painter.paint(
       canvas,
       center

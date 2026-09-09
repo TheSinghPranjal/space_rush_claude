@@ -1,7 +1,7 @@
 import 'dart:math' as math;
 import 'dart:ui';
 
-enum GamePhase { home, countdown, playing, paused, gameOver }
+enum GamePhase { home, countdown, playing, paused, resuming, gameOver }
 
 enum PowerId {
   magnet,
@@ -29,6 +29,7 @@ enum ObstacleType {
   splitWall,
   zigzag,
   breakableWall,
+  narrowWindow,
 }
 
 enum ObstacleMaterial { metal, energy, crystal, asteroid, laser, electric }
@@ -50,6 +51,105 @@ class PowerDefinition {
   final double duration;
   final PowerRarity rarity;
 }
+
+class ObstacleDefinition {
+  const ObstacleDefinition({
+    required this.type,
+    required this.material,
+    required this.minHealth,
+    required this.maxHealth,
+    required this.minPhase,
+    this.destructible = true,
+  });
+
+  final ObstacleType type;
+  final ObstacleMaterial material;
+  final int minHealth;
+  final int maxHealth;
+  final int minPhase;
+  final bool destructible;
+}
+
+const Map<ObstacleType, ObstacleDefinition> obstacleDefinitions = {
+  ObstacleType.wall: ObstacleDefinition(
+    type: ObstacleType.wall,
+    material: ObstacleMaterial.metal,
+    minHealth: 1,
+    maxHealth: 2,
+    minPhase: 0,
+  ),
+  ObstacleType.laserGate: ObstacleDefinition(
+    type: ObstacleType.laserGate,
+    material: ObstacleMaterial.laser,
+    minHealth: 1,
+    maxHealth: 1,
+    minPhase: 1,
+  ),
+  ObstacleType.asteroidCluster: ObstacleDefinition(
+    type: ObstacleType.asteroidCluster,
+    material: ObstacleMaterial.asteroid,
+    minHealth: 1,
+    maxHealth: 2,
+    minPhase: 1,
+  ),
+  ObstacleType.mineField: ObstacleDefinition(
+    type: ObstacleType.mineField,
+    material: ObstacleMaterial.asteroid,
+    minHealth: 1,
+    maxHealth: 1,
+    minPhase: 2,
+  ),
+  ObstacleType.piston: ObstacleDefinition(
+    type: ObstacleType.piston,
+    material: ObstacleMaterial.metal,
+    minHealth: 1,
+    maxHealth: 2,
+    minPhase: 2,
+  ),
+  ObstacleType.rotatingBar: ObstacleDefinition(
+    type: ObstacleType.rotatingBar,
+    material: ObstacleMaterial.energy,
+    minHealth: 1,
+    maxHealth: 1,
+    minPhase: 3,
+  ),
+  ObstacleType.electricField: ObstacleDefinition(
+    type: ObstacleType.electricField,
+    material: ObstacleMaterial.electric,
+    minHealth: 1,
+    maxHealth: 1,
+    minPhase: 3,
+    destructible: false,
+  ),
+  ObstacleType.splitWall: ObstacleDefinition(
+    type: ObstacleType.splitWall,
+    material: ObstacleMaterial.metal,
+    minHealth: 1,
+    maxHealth: 2,
+    minPhase: 3,
+  ),
+  ObstacleType.zigzag: ObstacleDefinition(
+    type: ObstacleType.zigzag,
+    material: ObstacleMaterial.metal,
+    minHealth: 1,
+    maxHealth: 2,
+    minPhase: 4,
+  ),
+  ObstacleType.breakableWall: ObstacleDefinition(
+    type: ObstacleType.breakableWall,
+    material: ObstacleMaterial.crystal,
+    minHealth: 3,
+    maxHealth: 3,
+    minPhase: 4,
+  ),
+  ObstacleType.narrowWindow: ObstacleDefinition(
+    type: ObstacleType.narrowWindow,
+    material: ObstacleMaterial.metal,
+    minHealth: 1,
+    maxHealth: 2,
+    minPhase: 3,
+  ),
+};
 
 const Map<PowerId, PowerDefinition> powerDefinitions = {
   PowerId.magnet: PowerDefinition(
@@ -195,21 +295,47 @@ class WorldCamera {
 }
 
 class Coin extends RectEntity {
-  Coin(Rect rect, {this.attracting = false, Offset? velocity})
-    : super(rect, velocity: velocity);
+  Coin(super.rect, {this.attracting = false, super.velocity});
   bool attracting;
+  bool turboPull = false;
   double pulse = 0;
+  double spawnAge = 0;
+
+  void recycle(Rect next) {
+    worldRect = next;
+    velocity = Offset.zero;
+    alive = true;
+    attracting = false;
+    turboPull = false;
+    pulse = 0;
+    spawnAge = 0;
+  }
 }
 
 class Bullet extends RectEntity {
   Bullet(super.rect);
   double trail = 0;
+
+  void recycle(Rect next) {
+    worldRect = next;
+    velocity = Offset.zero;
+    alive = true;
+    trail = 0;
+  }
 }
 
 class PowerPickup extends RectEntity {
   PowerPickup(super.rect, this.id);
-  final PowerId id;
+  PowerId id;
   double age = 0;
+
+  void recycle(Rect next, PowerId nextId) {
+    worldRect = next;
+    velocity = Offset.zero;
+    alive = true;
+    id = nextId;
+    age = 0;
+  }
 }
 
 class ObstacleSegment extends RectEntity {
@@ -217,12 +343,37 @@ class ObstacleSegment extends RectEntity {
     super.rect, {
     required this.material,
     required this.health,
+    int? maxHealth,
     this.dangerous = true,
-  });
-  final ObstacleMaterial material;
+  }) : maxHealth = maxHealth ?? health;
+  ObstacleMaterial material;
   int health;
+  int maxHealth;
   bool dangerous;
   double damageFlash = 0;
+
+  int get crackStage {
+    if (health >= maxHealth) return 0;
+    if (health <= 1 && maxHealth >= 3) return 2;
+    return 1;
+  }
+
+  void recycle(
+    Rect next, {
+    required ObstacleMaterial material,
+    required int health,
+    int? maxHealth,
+    bool dangerous = true,
+  }) {
+    worldRect = next;
+    velocity = Offset.zero;
+    alive = true;
+    this.material = material;
+    this.health = health;
+    this.maxHealth = maxHealth ?? health;
+    this.dangerous = dangerous;
+    damageFlash = 0;
+  }
 }
 
 class ObstacleGroup {
@@ -251,10 +402,24 @@ class Particle {
     this.size = 3,
   });
   Offset position;
-  final Offset velocity;
-  final Color color;
+  Offset velocity;
+  Color color;
   double life;
-  final double size;
+  double size;
+
+  void recycle(
+    Offset nextPosition,
+    Offset nextVelocity,
+    Color nextColor,
+    double nextLife, {
+    double nextSize = 3,
+  }) {
+    position = nextPosition;
+    velocity = nextVelocity;
+    color = nextColor;
+    life = nextLife;
+    size = nextSize;
+  }
 }
 
 class FloatingText {
@@ -279,6 +444,7 @@ class GameSnapshot {
     required this.newBest,
     this.countdown = '',
     this.banner = '',
+    this.hapticsEnabled = true,
   });
   final GamePhase phase;
   final int score;
@@ -292,6 +458,33 @@ class GameSnapshot {
   final bool newBest;
   final String countdown;
   final String banner;
+  final bool hapticsEnabled;
+
+  bool sameHud(GameSnapshot other) {
+    if (phase != other.phase ||
+        score != other.score ||
+        coins != other.coins ||
+        bestScore != other.bestScore ||
+        newBest != other.newBest ||
+        countdown != other.countdown ||
+        banner != other.banner ||
+        hapticsEnabled != other.hapticsEnabled ||
+        powersUsed != other.powersUsed ||
+        destroyed != other.destroyed) {
+      return false;
+    }
+    if ((elapsed * 10).floor() != (other.elapsed * 10).floor()) return false;
+    if (speed.round() != other.speed.round()) return false;
+    if (activePowers.length != other.activePowers.length) return false;
+    for (var i = 0; i < activePowers.length; i++) {
+      if (activePowers[i].id != other.activePowers[i].id) return false;
+      if ((activePowers[i].remaining * 10).floor() !=
+          (other.activePowers[i].remaining * 10).floor()) {
+        return false;
+      }
+    }
+    return true;
+  }
 }
 
 class DifficultyManager {
@@ -338,6 +531,20 @@ class PlayabilityValidator {
     return (gapCenter - fromX).abs() <=
         maxTravel + gapWidth / 2 - shipWidth / 2;
   }
+
+  bool validateReachability({
+    required double fromX,
+    required double gapCenter,
+    required double gapWidth,
+    required double distance,
+    required double speed,
+  }) => isReachable(
+    fromX: fromX,
+    gapCenter: gapCenter,
+    gapWidth: gapWidth,
+    distance: distance,
+    speed: speed,
+  );
 }
 
 enum CoinPattern { single, diagonal, arc, zigzag, horizontal }

@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flame/game.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -37,6 +39,7 @@ class _SpaceSurvivalAppState extends State<SpaceSurvivalApp>
   void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive ||
         state == AppLifecycleState.paused ||
+        state == AppLifecycleState.hidden ||
         state == AppLifecycleState.detached) {
       _game.onAppInactive();
     }
@@ -99,18 +102,42 @@ class GameInterface extends StatelessWidget {
   @override
   Widget build(BuildContext context) => ValueListenableBuilder<GameSnapshot>(
     valueListenable: snapshot,
-    builder: (context, state, _) => SafeArea(
-      child: switch (state.phase) {
-        GamePhase.home => HomeOverlay(
-          game: game,
-          snapshot: state,
-          onTutorial: onTutorial,
-        ),
-        GamePhase.paused => PauseOverlay(game: game),
-        GamePhase.gameOver => GameOverOverlay(game: game, snapshot: state),
-        _ => PlayOverlay(game: game, snapshot: state),
-      },
-    ),
+    builder: (context, state, _) {
+      final media = MediaQuery.sizeOf(context);
+      final width = math.min(media.width, math.max(320.0, media.height * 9 / 20));
+      return ColoredBox(
+        color: Colors.transparent,
+        child: switch (state.phase) {
+          GamePhase.paused => PauseOverlay(game: game, snapshot: state),
+          GamePhase.gameOver => GameOverOverlay(game: game, snapshot: state),
+          _ => Align(
+            child: SizedBox(
+              width: width,
+              height: media.height,
+              child: SafeArea(
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 280),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  child: KeyedSubtree(
+                    key: ValueKey(
+                      state.phase == GamePhase.home ? 'home' : 'play',
+                    ),
+                    child: state.phase == GamePhase.home
+                        ? HomeOverlay(
+                            game: game,
+                            snapshot: state,
+                            onTutorial: onTutorial,
+                          )
+                        : PlayOverlay(game: game, snapshot: state),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        },
+      );
+    },
   );
 }
 
@@ -170,7 +197,7 @@ class HomeOverlay extends StatelessWidget {
             value: snapshot.bestScore.toString(),
           ),
         const SizedBox(height: 18),
-        NeonButton(
+        PulseNeonButton(
           label: 'PLAY',
           icon: Icons.play_arrow_rounded,
           onPressed: game.start,
@@ -190,12 +217,12 @@ class HomeOverlay extends StatelessWidget {
         TextButton.icon(
           onPressed: game.toggleHaptics,
           icon: Icon(
-            game.hapticsEnabled
+            snapshot.hapticsEnabled
                 ? Icons.vibration_rounded
                 : Icons.vibration_outlined,
             size: 16,
           ),
-          label: Text(game.hapticsEnabled ? 'HAPTICS ON' : 'HAPTICS OFF'),
+          label: Text(snapshot.hapticsEnabled ? 'HAPTICS ON' : 'HAPTICS OFF'),
           style: TextButton.styleFrom(foregroundColor: const Color(0xff6d91ae)),
         ),
       ],
@@ -209,63 +236,70 @@ class PlayOverlay extends StatelessWidget {
   final GameSnapshot snapshot;
   @override
   Widget build(BuildContext context) {
-    final countdown = snapshot.phase == GamePhase.countdown;
-    return IgnorePointer(
-      ignoring: countdown,
-      child: Stack(
-        children: [
-          Padding(
-            padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
-            child: Row(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                _ScoreBlock(
-                  score: snapshot.score,
-                  time: snapshot.elapsed,
-                  coins: snapshot.coins,
-                ),
-                const Spacer(),
-                IconButton.filledTonal(
-                  onPressed: game.requestPause,
-                  icon: const Icon(Icons.pause_rounded),
-                  style: IconButton.styleFrom(
-                    backgroundColor: const Color(
-                      0xff142239,
-                    ).withValues(alpha: .88),
-                    foregroundColor: const Color(0xffddf5ff),
-                  ),
-                ),
-              ],
-            ),
-          ),
-          if (snapshot.activePowers.isNotEmpty)
-            Positioned(
-              top: 76,
-              left: 15,
-              right: 15,
-              child: PowerHud(active: snapshot.activePowers),
-            ),
-          if (countdown)
-            Center(
-              child: Text(
-                snapshot.countdown,
-                style: const TextStyle(
-                  color: Colors.white,
-                  fontWeight: FontWeight.w900,
-                  fontSize: 78,
-                  shadows: [Shadow(color: Color(0xff39e9ff), blurRadius: 26)],
+    final countdown =
+        snapshot.phase == GamePhase.countdown ||
+        snapshot.phase == GamePhase.resuming;
+    return Stack(
+      children: [
+        Padding(
+          padding: const EdgeInsets.fromLTRB(16, 10, 16, 0),
+          child: Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              _ScoreBlock(
+                score: snapshot.score,
+                time: snapshot.elapsed,
+                coins: snapshot.coins,
+              ),
+              const Spacer(),
+              IconButton.filledTonal(
+                onPressed: game.requestPause,
+                icon: const Icon(Icons.pause_rounded),
+                style: IconButton.styleFrom(
+                  backgroundColor: const Color(
+                    0xff142239,
+                  ).withValues(alpha: .88),
+                  foregroundColor: const Color(0xffddf5ff),
                 ),
               ),
+            ],
+          ),
+        ),
+        if (snapshot.activePowers.isNotEmpty)
+          Positioned(
+            top: 76,
+            left: 15,
+            right: 15,
+            child: PowerHud(active: snapshot.activePowers),
+          ),
+        if (countdown)
+          Center(
+            child: Text(
+              snapshot.countdown,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w900,
+                fontSize: 78,
+                shadows: [Shadow(color: Color(0xff39e9ff), blurRadius: 26)],
+              ),
             ),
-        ],
-      ),
+          ),
+        if (game.debugView)
+          Positioned(
+            left: 12,
+            right: 12,
+            bottom: 10,
+            child: DebugHud(game: game),
+          ),
+      ],
     );
   }
 }
 
 class PauseOverlay extends StatelessWidget {
-  const PauseOverlay({super.key, required this.game});
+  const PauseOverlay({super.key, required this.game, required this.snapshot});
   final SpaceSurvivalGame game;
+  final GameSnapshot snapshot;
   @override
   Widget build(BuildContext context) => Container(
     color: const Color(0xff02050c).withValues(alpha: .7),
@@ -312,7 +346,7 @@ class PauseOverlay extends StatelessWidget {
               onPressed: game.returnHome,
             ),
             _SecondaryAction(
-              label: game.hapticsEnabled ? 'HAPTICS ON' : 'HAPTICS OFF',
+              label: snapshot.hapticsEnabled ? 'HAPTICS ON' : 'HAPTICS OFF',
               icon: Icons.tune_rounded,
               onPressed: game.toggleHaptics,
             ),
@@ -323,7 +357,7 @@ class PauseOverlay extends StatelessWidget {
   );
 }
 
-class GameOverOverlay extends StatelessWidget {
+class GameOverOverlay extends StatefulWidget {
   const GameOverOverlay({
     super.key,
     required this.game,
@@ -332,61 +366,83 @@ class GameOverOverlay extends StatelessWidget {
   final SpaceSurvivalGame game;
   final GameSnapshot snapshot;
   @override
-  Widget build(BuildContext context) => Container(
-    color: const Color(0xff050811).withValues(alpha: .62),
-    child: Center(
-      child: SingleChildScrollView(
-        padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 24),
-        child: Column(
-          children: [
-            Text(
-              snapshot.newBest ? 'NEW BEST!' : 'MISSION OVER',
-              style: TextStyle(
-                color: snapshot.newBest
-                    ? const Color(0xffffd252)
-                    : const Color(0xffff8b7a),
-                fontSize: 29,
-                fontWeight: FontWeight.w900,
-                letterSpacing: 1.4,
-              ),
+  State<GameOverOverlay> createState() => _GameOverOverlayState();
+}
+
+class _GameOverOverlayState extends State<GameOverOverlay> {
+  bool _locked = true;
+
+  @override
+  void initState() {
+    super.initState();
+    Future<void>.delayed(const Duration(milliseconds: 420), () {
+      if (mounted) setState(() => _locked = false);
+    });
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final snapshot = widget.snapshot;
+    final game = widget.game;
+    return AbsorbPointer(
+      absorbing: _locked,
+      child: Container(
+        color: const Color(0xff050811).withValues(alpha: .62),
+        child: Center(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.symmetric(horizontal: 26, vertical: 24),
+            child: Column(
+              children: [
+                Text(
+                  snapshot.newBest ? 'NEW BEST!' : 'MISSION OVER',
+                  style: TextStyle(
+                    color: snapshot.newBest
+                        ? const Color(0xffffd252)
+                        : const Color(0xffff8b7a),
+                    fontSize: 29,
+                    fontWeight: FontWeight.w900,
+                    letterSpacing: 1.4,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  '${snapshot.score}',
+                  style: const TextStyle(
+                    fontSize: 64,
+                    fontWeight: FontWeight.w900,
+                    height: 1,
+                  ),
+                ),
+                const Text(
+                  'FINAL SCORE',
+                  style: TextStyle(
+                    color: Color(0xff9fb8cc),
+                    fontSize: 11,
+                    letterSpacing: 2,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+                const SizedBox(height: 22),
+                _ResultsCard(snapshot: snapshot),
+                const SizedBox(height: 22),
+                NeonButton(
+                  label: 'FLY AGAIN',
+                  icon: Icons.refresh_rounded,
+                  onPressed: game.restart,
+                ),
+                const SizedBox(height: 10),
+                _SecondaryAction(
+                  label: 'HOME',
+                  icon: Icons.home_outlined,
+                  onPressed: game.returnHome,
+                ),
+              ],
             ),
-            const SizedBox(height: 8),
-            Text(
-              '${snapshot.score}',
-              style: const TextStyle(
-                fontSize: 64,
-                fontWeight: FontWeight.w900,
-                height: 1,
-              ),
-            ),
-            const Text(
-              'FINAL SCORE',
-              style: TextStyle(
-                color: Color(0xff9fb8cc),
-                fontSize: 11,
-                letterSpacing: 2,
-                fontWeight: FontWeight.bold,
-              ),
-            ),
-            const SizedBox(height: 22),
-            _ResultsCard(snapshot: snapshot),
-            const SizedBox(height: 22),
-            NeonButton(
-              label: 'FLY AGAIN',
-              icon: Icons.refresh_rounded,
-              onPressed: game.restart,
-            ),
-            const SizedBox(height: 10),
-            _SecondaryAction(
-              label: 'HOME',
-              icon: Icons.home_outlined,
-              onPressed: game.returnHome,
-            ),
-          ],
+          ),
         ),
       ),
-    ),
-  );
+    );
+  }
 }
 
 class _ResultsCard extends StatelessWidget {
@@ -455,11 +511,12 @@ class PowerHud extends StatelessWidget {
       final urgent = power.remaining <= 2;
       return AnimatedScale(
         duration: const Duration(milliseconds: 180),
-        scale: urgent ? 1.06 : 1,
-        child: Container(
+        scale: urgent ? 1.08 : 1,
+        child: AnimatedContainer(
+          duration: const Duration(milliseconds: 180),
           padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 5),
           decoration: BoxDecoration(
-            color: const Color(0xff0d1a2c).withValues(alpha: .91),
+            color: Color(urgent ? 0xff3a1c14 : 0xff0d1a2c).withValues(alpha: .91),
             borderRadius: BorderRadius.circular(9),
             border: Border.all(
               color: definition.color.withValues(alpha: urgent ? 1 : .55),
@@ -477,9 +534,11 @@ class PowerHud extends StatelessWidget {
               ),
               const SizedBox(width: 5),
               Text(
-                '${power.remaining.toStringAsFixed(1)}s',
-                style: const TextStyle(
-                  color: Color(0xffdbeeff),
+                urgent
+                    ? '${definition.label} ${power.remaining.toStringAsFixed(1)}s'
+                    : '${power.remaining.toStringAsFixed(1)}s',
+                style: TextStyle(
+                  color: urgent ? const Color(0xffffe1c4) : const Color(0xffdbeeff),
                   fontSize: 11,
                   fontWeight: FontWeight.bold,
                 ),
@@ -571,8 +630,8 @@ class _StatChip extends StatelessWidget {
   );
 }
 
-class NeonButton extends StatelessWidget {
-  const NeonButton({
+class PulseNeonButton extends StatefulWidget {
+  const PulseNeonButton({
     super.key,
     required this.label,
     required this.icon,
@@ -582,14 +641,136 @@ class NeonButton extends StatelessWidget {
   final IconData icon;
   final VoidCallback onPressed;
   @override
+  State<PulseNeonButton> createState() => _PulseNeonButtonState();
+}
+
+class _PulseNeonButtonState extends State<PulseNeonButton>
+    with SingleTickerProviderStateMixin {
+  late final AnimationController _controller = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 1400),
+  )..repeat(reverse: true);
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) => AnimatedBuilder(
+    animation: _controller,
+    builder: (context, child) {
+      final glow = 16 + _controller.value * 10;
+      return Transform.scale(
+        scale: .985 + _controller.value * .03,
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            boxShadow: [
+              BoxShadow(
+                color: const Color(0x8837dffb),
+                blurRadius: glow,
+                spreadRadius: 1,
+              ),
+            ],
+          ),
+          child: child,
+        ),
+      );
+    },
+    child: NeonButton(
+      label: widget.label,
+      icon: widget.icon,
+      onPressed: widget.onPressed,
+      glow: false,
+    ),
+  );
+}
+
+class DebugHud extends StatelessWidget {
+  const DebugHud({super.key, required this.game});
+  final SpaceSurvivalGame game;
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.fromLTRB(10, 8, 10, 8),
+    decoration: BoxDecoration(
+      color: const Color(0xcc071018),
+      borderRadius: BorderRadius.circular(10),
+      border: Border.all(color: const Color(0xff2d536d)),
+    ),
+    child: Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          game.debugLine,
+          style: const TextStyle(
+            fontSize: 10,
+            fontFamily: 'monospace',
+            color: Color(0xff9be7ff),
+          ),
+        ),
+        const SizedBox(height: 6),
+        Wrap(
+          spacing: 4,
+          runSpacing: 4,
+          children: [
+            for (final id in PowerId.values)
+              GestureDetector(
+                onTap: () => game.debugSpawn(id),
+                child: Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 6,
+                    vertical: 3,
+                  ),
+                  decoration: BoxDecoration(
+                    color: const Color(0xff132235),
+                    borderRadius: BorderRadius.circular(6),
+                  ),
+                  child: Text(
+                    powerDefinitions[id]!.symbol,
+                    style: TextStyle(
+                      color: powerDefinitions[id]!.color,
+                      fontSize: 11,
+                      fontWeight: FontWeight.w900,
+                    ),
+                  ),
+                ),
+              ),
+          ],
+        ),
+      ],
+    ),
+  );
+}
+
+class NeonButton extends StatelessWidget {
+  const NeonButton({
+    super.key,
+    required this.label,
+    required this.icon,
+    required this.onPressed,
+    this.glow = true,
+  });
+  final String label;
+  final IconData icon;
+  final VoidCallback onPressed;
+  final bool glow;
+  @override
   Widget build(BuildContext context) => SizedBox(
     width: double.infinity,
     height: 56,
     child: DecoratedBox(
       decoration: BoxDecoration(
         borderRadius: BorderRadius.circular(16),
-        boxShadow: const [
-          BoxShadow(color: Color(0x6637dffb), blurRadius: 20, spreadRadius: 1),
+        boxShadow: [
+          if (glow)
+            const BoxShadow(
+              color: Color(0x6637dffb),
+              blurRadius: 20,
+              spreadRadius: 1,
+            ),
         ],
       ),
       child: FilledButton.icon(
@@ -677,7 +858,7 @@ class TutorialSheet extends StatelessWidget {
               style: TextStyle(fontWeight: FontWeight.w900, letterSpacing: 1.2),
             ),
             const Text(
-              'Move through clear routes while coins and hazards scroll past.',
+              'Drag left and right only. The ship stays on a fixed flight line.',
               textAlign: TextAlign.center,
               style: TextStyle(color: Color(0xffa5bbcd)),
             ),
