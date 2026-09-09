@@ -105,32 +105,37 @@ class GameInterface extends StatelessWidget {
     builder: (context, state, _) {
       final media = MediaQuery.sizeOf(context);
       final width = math.min(media.width, math.max(320.0, media.height * 9 / 20));
-      return Align(
-        child: SizedBox(
-          width: width,
-          height: media.height,
-          child: SafeArea(
-            child: AnimatedSwitcher(
-              duration: const Duration(milliseconds: 280),
-              switchInCurve: Curves.easeOutCubic,
-              switchOutCurve: Curves.easeInCubic,
-              child: KeyedSubtree(
-                key: ValueKey(state.phase),
-                child: switch (state.phase) {
-                  GamePhase.home => HomeOverlay(
-                    game: game,
-                    snapshot: state,
-                    onTutorial: onTutorial,
+      return ColoredBox(
+        color: Colors.transparent,
+        child: switch (state.phase) {
+          GamePhase.paused => PauseOverlay(game: game, snapshot: state),
+          GamePhase.gameOver => GameOverOverlay(game: game, snapshot: state),
+          _ => Align(
+            child: SizedBox(
+              width: width,
+              height: media.height,
+              child: SafeArea(
+                child: AnimatedSwitcher(
+                  duration: const Duration(milliseconds: 280),
+                  switchInCurve: Curves.easeOutCubic,
+                  switchOutCurve: Curves.easeInCubic,
+                  child: KeyedSubtree(
+                    key: ValueKey(
+                      state.phase == GamePhase.home ? 'home' : 'play',
+                    ),
+                    child: state.phase == GamePhase.home
+                        ? HomeOverlay(
+                            game: game,
+                            snapshot: state,
+                            onTutorial: onTutorial,
+                          )
+                        : PlayOverlay(game: game, snapshot: state),
                   ),
-                  GamePhase.paused => PauseOverlay(game: game, snapshot: state),
-                  GamePhase.gameOver =>
-                    GameOverOverlay(game: game, snapshot: state),
-                  _ => PlayOverlay(game: game, snapshot: state),
-                },
+                ),
               ),
             ),
           ),
-        ),
+        },
       );
     },
   );

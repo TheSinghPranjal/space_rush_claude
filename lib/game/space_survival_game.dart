@@ -132,6 +132,13 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   int get powersUsed => powers.activations;
   bool get lastSpawnFair => _lastFair;
 
+  String get _countdownLabel {
+    if (_countdown > 2) return '3';
+    if (_countdown > 1) return '2';
+    if (_countdown > .4) return '1';
+    return 'GO';
+  }
+
   String get debugLine =>
       't=${_elapsed.toStringAsFixed(1)} '
       'world=${speed.worldScrollSpeed.toStringAsFixed(0)} '
@@ -206,7 +213,7 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   void start() {
     resetRun();
     flow.startCountdown();
-    _countdown = balance.startCountdown;
+    _countdown = 3;
     _banner = 'SYSTEMS READY';
     _bannerLife = 1.2;
     _transition = 1;
@@ -235,7 +242,7 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   void resume() {
     if (phase != GamePhase.paused) return;
     flow.resumeFromPause();
-    _countdown = balance.resumeCountdown;
+    _countdown = 2.2;
     _banner = 'READY';
     _bannerLife = 1.0;
     clock.armResume();
@@ -326,7 +333,7 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
         audio.play(GameSfx.countdown);
         _haptic(HapticFeedback.mediumImpact);
       }
-      _emit();
+      _emit(force: true);
       return;
     }
     if (phase == GamePhase.paused || phase == GamePhase.gameOver) return;
@@ -1087,7 +1094,7 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
       destroyed: destroyed,
       newBest: _newBest,
       countdown: phase == GamePhase.countdown || phase == GamePhase.resuming
-          ? (_countdown > .35 ? _countdown.ceil().toString() : 'GO')
+          ? _countdownLabel
           : '',
       banner: _bannerLife > 0 ? _banner : '',
       hapticsEnabled: hapticsEnabled,
