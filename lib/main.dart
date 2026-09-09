@@ -1,3 +1,5 @@
+import 'dart:math' as math;
+
 import 'package:flame/game.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -100,26 +102,37 @@ class GameInterface extends StatelessWidget {
   @override
   Widget build(BuildContext context) => ValueListenableBuilder<GameSnapshot>(
     valueListenable: snapshot,
-    builder: (context, state, _) => SafeArea(
-      child: AnimatedSwitcher(
-        duration: const Duration(milliseconds: 280),
-        switchInCurve: Curves.easeOutCubic,
-        switchOutCurve: Curves.easeInCubic,
-        child: KeyedSubtree(
-          key: ValueKey(state.phase),
-          child: switch (state.phase) {
-            GamePhase.home => HomeOverlay(
-              game: game,
-              snapshot: state,
-              onTutorial: onTutorial,
+    builder: (context, state, _) {
+      final media = MediaQuery.sizeOf(context);
+      final width = math.min(media.width, math.max(320.0, media.height * 9 / 20));
+      return Align(
+        child: SizedBox(
+          width: width,
+          height: media.height,
+          child: SafeArea(
+            child: AnimatedSwitcher(
+              duration: const Duration(milliseconds: 280),
+              switchInCurve: Curves.easeOutCubic,
+              switchOutCurve: Curves.easeInCubic,
+              child: KeyedSubtree(
+                key: ValueKey(state.phase),
+                child: switch (state.phase) {
+                  GamePhase.home => HomeOverlay(
+                    game: game,
+                    snapshot: state,
+                    onTutorial: onTutorial,
+                  ),
+                  GamePhase.paused => PauseOverlay(game: game, snapshot: state),
+                  GamePhase.gameOver =>
+                    GameOverOverlay(game: game, snapshot: state),
+                  _ => PlayOverlay(game: game, snapshot: state),
+                },
+              ),
             ),
-            GamePhase.paused => PauseOverlay(game: game, snapshot: state),
-            GamePhase.gameOver => GameOverOverlay(game: game, snapshot: state),
-            _ => PlayOverlay(game: game, snapshot: state),
-          },
+          ),
         ),
-      ),
-    ),
+      );
+    },
   );
 }
 

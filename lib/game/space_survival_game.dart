@@ -97,15 +97,24 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
   double get targetShipX => steering.targetX;
   set targetShipX(double value) => steering.setDragX(value);
 
+  Rect get viewRect {
+    if (size.x <= 0 || size.y <= 0) return Rect.zero;
+    final portraitWidth = size.y * 9 / 20;
+    final width = math.min(size.x, math.max(320.0, portraitWidth));
+    final left = (size.x - width) / 2;
+    return Rect.fromLTWH(left, 0, width, size.y);
+  }
+
   Rect get playableArea {
-    final horizontalInset = math.max(20.0, size.x * .045);
-    final hudClearance = math.max(132.0, size.y * .17);
-    final bottomInset = math.max(24.0, size.y * .04);
+    final view = viewRect;
+    final horizontalInset = math.max(20.0, view.width * .045);
+    final hudClearance = math.max(132.0, view.height * .17);
+    final bottomInset = math.max(24.0, view.height * .04);
     return Rect.fromLTRB(
-      horizontalInset,
+      view.left + horizontalInset,
       hudClearance,
-      size.x - horizontalInset,
-      size.y - bottomInset,
+      view.right - horizontalInset,
+      view.bottom - bottomInset,
     );
   }
 
@@ -1133,12 +1142,24 @@ class SpaceSurvivalGame extends FlameGame with PanDetector {
       );
     }
     if (debugView && isPlaying) _drawFairnessOverlay(canvas);
+    _drawLetterbox(canvas);
     if (_transition > 0) {
       canvas.drawRect(
         screen,
         Paint()..color = Color.fromRGBO(5, 9, 20, _transition),
       );
     }
+  }
+
+  void _drawLetterbox(Canvas canvas) {
+    final view = viewRect;
+    if (view.left <= 1) return;
+    final paint = Paint()..color = const Color(0xff02050c);
+    canvas.drawRect(Rect.fromLTWH(0, 0, view.left, size.y), paint);
+    canvas.drawRect(
+      Rect.fromLTWH(view.right, 0, size.x - view.right, size.y),
+      paint,
+    );
   }
 
   void _drawFairnessOverlay(Canvas canvas) {
